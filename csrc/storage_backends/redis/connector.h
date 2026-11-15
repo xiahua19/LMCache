@@ -2,11 +2,16 @@
 #pragma once
 
 #include "../connector_base.h"
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <atomic>
 #include <cstring>
 #include <vector>
 
@@ -80,7 +85,16 @@ struct WorkerConn {
     if (fd >= 0) ::close(fd);
   }
 
-  void connect(const std::string& host, int port);
+  // creates the socket; fd is valid afterwards. The destructor closes it, also
+  // when a later step throws, so no step below closes fd itself.
+  void open_socket();
+  // TCP handshake, at most timeout_ms. The wait is cut into short slices that
+  // check *stop, so a connector being closed never waits for a handshake.
+  // Requires open_socket(). Throws on failure, timeout or when *stop is set.
+  void connect(const std::string& host, int port, int timeout_ms,
+               const std::atomic<bool>* stop);
+  // bound every later send and recv on this connection (0 = no bound)
+  void set_io_timeout_ms(int timeout_ms);
   void authenticate_if_needed();
   void send_all(const void* data, size_t len);
   void send_multipart(const std::vector<std::pair<const void*, size_t>>& parts);
@@ -96,6 +110,9 @@ class RedisConnector : public ConnectorBase<WorkerConn> {
                  std::string username = "", std::string password = "");
   ~RedisConnector() override;
 
+  bool supports_health_probe() const override { return true; }
+  bool supports_reconnect() const override { return true; }
+
  protected:
   WorkerConn create_connection() override;
   void do_single_get(WorkerConn& conn, const std::string& key, void* buf,
@@ -106,13 +123,29 @@ class RedisConnector : public ConnectorBase<WorkerConn> {
   bool do_single_delete(WorkerConn& conn, const std::string& key) override;
   void shutdown_connections() override;
 
+  // health (see ConnectorBase). Every blocking call a worker can be in is
+  // interruptible, so reconnect() is supported: the handshake checks stop_,
+  // and AUTH and requests run on a socket that interrupt_connections() shuts
+  // down.
+  std::string do_check_backend(int timeout_ms) override;
+  std::string do_find_broken_connection() override;
+  void interrupt_connections() override;
+  void connection_closed(WorkerConn& conn) override;
+
  private:
+  // Makes interrupt_connections() reach this socket. Throws if the connector is
+  // already shutting down, so a worker that connected too late does not start
+  // blocking in AUTH with nobody left to interrupt it.
+  void register_fd(int fd);
+  void unregister_fd(int fd);
+
   std::string host_;
   int port_;
   std::string username_;
   std::string password_;
   std::mutex worker_fds_mu_;
   std::vector<int> worker_fds_;
+  bool shutting_down_ = false;  // guarded by worker_fds_mu_
 };
 
 }  // namespace connector

@@ -3,6 +3,7 @@
 
 #include "connector_types.h"
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -124,6 +125,45 @@ class IStorageConnector {
   idempotent: safe to call multiple times (subsequent calls are no-ops)
   */
   virtual void close() = 0;
+
+  /*
+  Health interface (optional, mirrors L2AdapterInterface).
+
+  The defaults say "not provided", so connectors written before these existed
+  keep working unchanged.
+  */
+
+  // whether probe_health() is implemented
+  virtual bool supports_health_probe() const { return false; }
+
+  /*
+  check that the backend answers and that this connector's connections are
+  usable. blocks the calling thread for at most about timeout_ms; the caller
+  must not hold any lock a worker needs. does not touch any data buffer.
+  */
+  virtual HealthProbe probe_health(int timeout_ms) {
+    (void)timeout_ms;
+    throw std::runtime_error("probe_health is not supported");
+  }
+
+  // whether reconnect() is implemented
+  virtual bool supports_reconnect() const { return false; }
+
+  /*
+  re-establish every worker's connection without destroying the connector,
+  waiting at most about timeout_ms for the new connections.
+
+  on normal return every worker holds a new connection. every request
+  submitted before the call either completed or is completed as a failure
+  (store unsuccessful, empty per-key results) through the usual completion
+  queue, and no worker touches the buffer of a request it has reported as
+  finished. throws if the connections could not be restored; the caller may
+  call again.
+  */
+  virtual void reconnect(int timeout_ms) {
+    (void)timeout_ms;
+    throw std::runtime_error("reconnect is not supported");
+  }
 };
 
 }  // namespace connector

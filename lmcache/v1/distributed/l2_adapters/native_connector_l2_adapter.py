@@ -38,10 +38,19 @@ from lmcache.v1.distributed.l2_adapters.base import (
     L2AdapterInterface,
     L2TaskId,
 )
+from lmcache.v1.distributed.l2_adapters.health import (
+    HealthProbe,
+    L2ReconnectError,
+    ProbeStatus,
+)
 from lmcache.v1.memory_management import MemoryObj, TensorMemoryObj
 from lmcache.v1.platform import create_event_notifier
 
 logger = init_logger(__name__)
+
+# How long reconnect() waits for the workers' new connections. The monitor only
+# reconnects after a probe found the backend answering, so this is generous.
+_RECONNECT_TIMEOUT_MS = 5000
 
 
 @cache
@@ -424,6 +433,32 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         }
         status.update(self._extra_status)
         return status
+
+    # ---------------------------------------------------------------
+    # Health interface: forwarded to the native client, which knows its
+    # backend. A client without these methods (an older build) is simply
+    # not managed.
+    # ---------------------------------------------------------------
+
+    @property
+    def supports_health_probe(self) -> bool:
+        supports = getattr(self._client, "supports_health_probe", None)
+        return supports is not None and bool(supports())
+
+    def probe_health(self, timeout_s: float) -> HealthProbe:
+        status, reason = self._client.probe_health(int(timeout_s * 1000))
+        return HealthProbe(ProbeStatus(status), reason)
+
+    @property
+    def supports_reconnect(self) -> bool:
+        supports = getattr(self._client, "supports_reconnect", None)
+        return supports is not None and bool(supports())
+
+    def reconnect(self) -> None:
+        try:
+            self._client.reconnect(_RECONNECT_TIMEOUT_MS)
+        except RuntimeError as e:
+            raise L2ReconnectError(str(e)) from e
 
     # ---------------------------------------------------------------
     # Cleanup

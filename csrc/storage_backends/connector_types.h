@@ -100,5 +100,23 @@ struct Completion {
   std::string error;
 };
 
+// What ``IStorageConnector::probe_health`` found.
+enum class HealthStatus {
+  // the backend answers and every worker holds a usable connection
+  OK,
+  // the backend does not answer
+  UNREACHABLE,
+  // the backend answers but this connector's own connections are broken (a
+  // backend restart left stale sockets, a worker could not connect): only
+  // reconnect() restores them
+  RECONNECT_NEEDED,
+};
+
+struct HealthProbe {
+  HealthStatus status = HealthStatus::OK;
+  // why the status is not OK, empty when OK
+  std::string reason;
+};
+
 }  // namespace connector
 }  // namespace lmcache

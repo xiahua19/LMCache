@@ -23,28 +23,37 @@ example usage (see `redis/pybind.cpp`):
       LMCACHE_BIND_CONNECTOR_METHODS(MyConnector);
 */
 
-#define LMCACHE_BIND_CONNECTOR_METHODS(ConnectorType)                  \
-  .def("event_fd", &ConnectorType::event_fd)                           \
-      .def("submit_batch_get",                                         \
-           lmcache::connector::pybind_utils::bind_submit_batch_get<    \
-               ConnectorType>(),                                       \
-           py::arg("keys"), py::arg("memoryviews"))                    \
-      .def("submit_batch_set",                                         \
-           lmcache::connector::pybind_utils::bind_submit_batch_set<    \
-               ConnectorType>(),                                       \
-           py::arg("keys"), py::arg("memoryviews"))                    \
-      .def("submit_batch_exists",                                      \
-           lmcache::connector::pybind_utils::bind_submit_batch_exists< \
-               ConnectorType>(),                                       \
-           py::arg("keys"))                                            \
-      .def("submit_batch_delete",                                      \
-           lmcache::connector::pybind_utils::bind_submit_batch_delete< \
-               ConnectorType>(),                                       \
-           py::arg("keys"))                                            \
-      .def("drain_completions",                                        \
-           lmcache::connector::pybind_utils::bind_drain_completions<   \
-               ConnectorType>())                                       \
-      .def("close", &ConnectorType::close)
+#define LMCACHE_BIND_CONNECTOR_METHODS(ConnectorType)                      \
+  .def("event_fd", &ConnectorType::event_fd)                               \
+      .def("submit_batch_get",                                             \
+           lmcache::connector::pybind_utils::bind_submit_batch_get<        \
+               ConnectorType>(),                                           \
+           py::arg("keys"), py::arg("memoryviews"))                        \
+      .def("submit_batch_set",                                             \
+           lmcache::connector::pybind_utils::bind_submit_batch_set<        \
+               ConnectorType>(),                                           \
+           py::arg("keys"), py::arg("memoryviews"))                        \
+      .def("submit_batch_exists",                                          \
+           lmcache::connector::pybind_utils::bind_submit_batch_exists<     \
+               ConnectorType>(),                                           \
+           py::arg("keys"))                                                \
+      .def("submit_batch_delete",                                          \
+           lmcache::connector::pybind_utils::bind_submit_batch_delete<     \
+               ConnectorType>(),                                           \
+           py::arg("keys"))                                                \
+      .def("drain_completions",                                            \
+           lmcache::connector::pybind_utils::bind_drain_completions<       \
+               ConnectorType>())                                           \
+      .def("supports_health_probe", &ConnectorType::supports_health_probe) \
+      .def("probe_health",                                                 \
+           lmcache::connector::pybind_utils::bind_probe_health<            \
+               ConnectorType>(),                                           \
+           py::arg("timeout_ms"))                                          \
+      .def("supports_reconnect", &ConnectorType::supports_reconnect)       \
+      .def("reconnect", &ConnectorType::reconnect, py::arg("timeout_ms"),  \
+           py::call_guard<py::gil_scoped_release>())                       \
+      .def("close", &ConnectorType::close,                                 \
+           py::call_guard<py::gil_scoped_release>())
 
 template <typename ConnectorType>
 auto bind_submit_batch_get() {
@@ -156,6 +165,28 @@ auto bind_drain_completions() {
     return result;
   };
 }
+
+// probe_health(timeout_ms) -> (status, reason), status one of "ok",
+// "unreachable", "reconnect_needed". Waits for the backend, so the GIL is
+// released for the whole call.
+template <typename ConnectorType>
+auto bind_probe_health() {
+  return [](ConnectorType& self, int timeout_ms) {
+    HealthProbe probe;
+    {
+      py::gil_scoped_release release;
+      probe = self.probe_health(timeout_ms);
+    }
+    const char* status = "ok";
+    if (probe.status == HealthStatus::UNREACHABLE) {
+      status = "unreachable";
+    } else if (probe.status == HealthStatus::RECONNECT_NEEDED) {
+      status = "reconnect_needed";
+    }
+    return py::make_tuple(status, probe.reason);
+  };
+}
+
 inline WorkerPoolConfig parse_per_op_workers(const py::object& obj) {
   if (obj.is_none()) {
     return {};

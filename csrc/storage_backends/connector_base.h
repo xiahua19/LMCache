@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <memory>
@@ -39,6 +40,26 @@ class:
 
 optionally override do_single_delete() to support eviction (default returns
 false for all keys).
+
+health (optional, see connector_interface.h). A backend opts in by overriding
+supports_health_probe() / supports_reconnect() and the hooks below; the base
+class owns everything that does not depend on the backend:
+- do_check_backend(timeout_ms): is the backend answering? (a fresh connection,
+  a cluster-state query, a mount check). runs on the caller's thread and must
+  return within timeout_ms.
+- do_find_broken_connection(): is any worker's idle connection known to be
+  dead? (a socket the peer closed)
+- interrupt_connections(): end every blocking call a worker is in, without
+  making the connector unusable. reconnect() relies on it: a backend that
+  cannot interrupt its workers must not support reconnect.
+- connection_closed(conn): a worker is about to destroy conn.
+
+reconnect() keeps the worker threads and replaces only their connections. A
+worker reports a request it was serving when its connection was interrupted as
+failed, and only after the I/O on it has ended, so a reported request never
+has a backend call left that touches its buffer. A worker that cannot connect
+stays alive and fails the requests it gets at once, until a later reconnect()
+succeeds.
 
 see the RedisConnector (csrc/redis/) implementing the RESP2 protocol over TCP
 for an example
@@ -214,6 +235,65 @@ class ConnectorBase : public IStorageConnector {
     return completions_list;
   }
 
+  HealthProbe probe_health(int timeout_ms) override {
+    std::string reason = do_check_backend(timeout_ms);
+    if (!reason.empty()) {
+      return HealthProbe{HealthStatus::UNREACHABLE, std::move(reason)};
+    }
+    const int total = total_workers_.load(std::memory_order_acquire);
+    const int connected = connected_workers_.load(std::memory_order_acquire);
+    if (connected < total) {
+      return HealthProbe{HealthStatus::RECONNECT_NEEDED,
+                         std::to_string(total - connected) + " of " +
+                             std::to_string(total) +
+                             " workers have no connection"};
+    }
+    reason = do_find_broken_connection();
+    if (!reason.empty()) {
+      return HealthProbe{HealthStatus::RECONNECT_NEEDED, std::move(reason)};
+    }
+    return HealthProbe{};
+  }
+
+  void reconnect(int timeout_ms) override {
+    // one reconnect at a time: the workers answer into a single record
+    std::lock_guard<std::mutex> serial(reconnect_serial_mu_);
+    if (closed_.load(std::memory_order_acquire)) {
+      throw std::runtime_error("connector is closed");
+    }
+    const int total = total_workers_.load(std::memory_order_acquire);
+
+    // 1. end the I/O on the old connections
+    interrupt_connections();
+
+    // 2. ask every worker for a new connection
+    const uint64_t target =
+        reconnect_epoch_.load(std::memory_order_acquire) + 1;
+    {
+      std::lock_guard<std::mutex> lk(reconnect_mu_);
+      reconnect_target_ = target;
+      reconnect_done_ = 0;
+      reconnect_failed_ = 0;
+      reconnect_first_error_.clear();
+    }
+    reconnect_epoch_.store(target, std::memory_order_release);
+    wake_all_workers();
+
+    // 3. wait until each of them has tried
+    std::unique_lock<std::mutex> lk(reconnect_mu_);
+    if (!reconnect_cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+                                [&] { return reconnect_done_ >= total; })) {
+      throw std::runtime_error(
+          "reconnect timed out: " + std::to_string(reconnect_done_) + " of " +
+          std::to_string(total) + " workers have a new connection");
+    }
+    if (reconnect_failed_ > 0) {
+      throw std::runtime_error(
+          std::to_string(reconnect_failed_) + " of " + std::to_string(total) +
+          " workers could not connect: " + reconnect_first_error_);
+    }
+  }
+
   void close() override {
     if (closed_.exchange(true, std::memory_order_acq_rel)) {
       return;  // Already closed
@@ -274,6 +354,8 @@ class ConnectorBase : public IStorageConnector {
       if (!lane_ptr) {
         lane_ptr = std::make_unique<WorkerLane>();
       }
+      // counted before the threads start, so connected never exceeds total
+      total_workers_.fetch_add(count, std::memory_order_release);
       start_lane_workers(*lane_ptr, count);
     }
 
@@ -288,6 +370,7 @@ class ConnectorBase : public IStorageConnector {
     }
 
     if (need_shared) {
+      total_workers_.fetch_add(num_workers_, std::memory_order_release);
       workers_.reserve(static_cast<size_t>(num_workers_));
       for (int i = 0; i < num_workers_; i++) {
         workers_.emplace_back([this]() { this->worker_loop(); });
@@ -350,6 +433,31 @@ class ConnectorBase : public IStorageConnector {
   }
   virtual void shutdown_connections() {}
   virtual void on_workers_stopped() {}
+
+  // Whether the backend answers, checked without any worker. Returns why it
+  // does not, or an empty string when it does. Called on the caller's thread;
+  // must return within timeout_ms. Only called when supports_health_probe().
+  virtual std::string do_check_backend(int timeout_ms) {
+    (void)timeout_ms;
+    return "";
+  }
+
+  // Whether some worker's connection is known to be dead although the backend
+  // answers (the peer closed the socket, for example). Returns a description
+  // or an empty string. Called on the caller's thread while workers may be
+  // using their connections, so it must only look. Only called when
+  // supports_health_probe().
+  virtual std::string do_find_broken_connection() { return ""; }
+
+  // End every blocking call a worker is in, so that its request fails and the
+  // worker returns to its loop. Unlike shutdown_connections() the connector
+  // stays usable: workers connect again afterwards. Only called when
+  // supports_reconnect().
+  virtual void interrupt_connections() {}
+
+  // The worker is about to destroy conn. The place to forget anything that
+  // refers to it.
+  virtual void connection_closed(ConnectionType& conn) { (void)conn; }
 
   bool is_stopping() const { return stop_.load(std::memory_order_acquire); }
 
@@ -534,52 +642,154 @@ class ConnectorBase : public IStorageConnector {
 
   void worker_loop() { worker_loop_for_queue(req_mu_, req_cv_, requests_); }
 
+  // Counts a worker as connected while it holds a connection, and tells the
+  // backend when the connection goes away, on every path out of the scope.
+  struct ConnectionScope {
+    ConnectorBase& owner;
+    ConnectionType& conn;
+    ConnectionScope(ConnectorBase& o, ConnectionType& c) : owner(o), conn(c) {
+      owner.connected_workers_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~ConnectionScope() {
+      owner.connection_closed(conn);
+      owner.connected_workers_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    ConnectionScope(const ConnectionScope&) = delete;
+    ConnectionScope& operator=(const ConnectionScope&) = delete;
+  };
+
+  // Make every worker re-check its wait condition. The queue's mutex is taken
+  // so that a worker which has just evaluated the condition cannot go to sleep
+  // without seeing the change.
+  void wake_all_workers() {
+    {
+      std::lock_guard<std::mutex> lk(req_mu_);
+    }
+    req_cv_.notify_all();
+    for (auto& [key, lane] : lanes_) {
+      {
+        std::lock_guard<std::mutex> lk(lane->mu);
+      }
+      lane->cv.notify_all();
+    }
+  }
+
+  // A worker tells reconnect() that it has tried to connect for `epoch`.
+  void report_connect_result(uint64_t epoch, bool ok,
+                             const std::string& error) {
+    {
+      std::lock_guard<std::mutex> lk(reconnect_mu_);
+      if (epoch != reconnect_target_) {
+        return;  // not the reconnect() that is waiting (or none is)
+      }
+      reconnect_done_ += 1;
+      if (!ok) {
+        reconnect_failed_ += 1;
+        if (reconnect_first_error_.empty()) {
+          reconnect_first_error_ = error;
+        }
+      }
+    }
+    reconnect_cv_.notify_all();
+  }
+
+  // One worker thread: connect, serve requests, and connect again whenever
+  // reconnect() asks. The thread only ends when the connector stops.
   void worker_loop_for_queue(std::mutex& req_mu,
                              std::condition_variable& req_cv,
                              std::queue<Request>& requests) {
-    try {
-      // create connection (derived class specific)
-      ConnectionType conn = create_connection();
-
-      for (;;) {
-        Request req;
-
-        // 1. grab a request from the submission queue
-        {
-          std::unique_lock<std::mutex> lk(req_mu);
-          req_cv.wait(lk, [&] {
-            return stop_.load(std::memory_order_acquire) || !requests.empty();
-          });
-          if (stop_.load(std::memory_order_acquire) && requests.empty()) {
-            break;  // exit loop
-          }
-          req = std::move(requests.front());
-          requests.pop();
+    uint64_t epoch = reconnect_epoch_.load(std::memory_order_acquire);
+    while (!is_stopping()) {
+      bool connected = false;
+      std::string connect_error;
+      try {
+        // create connection (derived class specific)
+        ConnectionType conn = create_connection();
+        connected = true;
+        ConnectionScope scope(*this, conn);
+        report_connect_result(epoch, true, "");
+        epoch = serve_requests(req_mu, req_cv, requests, &conn, "", epoch);
+      } catch (const std::exception& e) {
+        if (connected) {
+          fprintf(stderr, "[LMCache Connector Worker Error] %s\n", e.what());
+          return;
         }
+        connect_error = e.what();
+      } catch (...) {
+        if (connected) {
+          fprintf(stderr,
+                  "[LMCache Connector Worker Error] Unknown exception\n");
+          return;
+        }
+        connect_error = "unknown exception";
+      }
 
-        Completion comp;
-        comp.future_id = req.future_id;
+      if (!connected && !is_stopping()) {
+        fprintf(stderr, "[LMCache Connector Worker] cannot connect: %s\n",
+                connect_error.c_str());
+        report_connect_result(epoch, false, connect_error);
+        epoch = serve_requests(req_mu, req_cv, requests, nullptr, connect_error,
+                               epoch);
+      }
+    }
+  }
 
-        // 2. execute the requested operation
+  // Serve requests with `conn` until the connector stops or reconnect() asks
+  // for new connections; returns the epoch to connect for. With no connection
+  // (conn == nullptr) a request fails at once, so a caller learns about a down
+  // backend without waiting.
+  uint64_t serve_requests(std::mutex& req_mu, std::condition_variable& req_cv,
+                          std::queue<Request>& requests, ConnectionType* conn,
+                          const std::string& connect_error, uint64_t epoch) {
+    for (;;) {
+      Request req;
+
+      // 1. grab a request from the submission queue, or notice that
+      // reconnect() wants this worker to connect again
+      {
+        std::unique_lock<std::mutex> lk(req_mu);
+        req_cv.wait(lk, [&] {
+          return stop_.load(std::memory_order_acquire) || !requests.empty() ||
+                 reconnect_epoch_.load(std::memory_order_acquire) != epoch;
+        });
+        if (stop_.load(std::memory_order_acquire) && requests.empty()) {
+          return epoch;
+        }
+        uint64_t current = reconnect_epoch_.load(std::memory_order_acquire);
+        if (current != epoch) {
+          return current;
+        }
+        req = std::move(requests.front());
+        requests.pop();
+      }
+
+      Completion comp;
+      comp.future_id = req.future_id;
+
+      // 2. execute the requested operation
+      if (conn == nullptr) {
+        comp.ok = false;
+        comp.error = "no connection: " + connect_error;
+      } else {
         try {
           switch (req.op) {
             case Op::BATCH_TILE_GET:
-              do_batch_get(conn, req);
+              do_batch_get(*conn, req);
               comp.ok = true;
               break;
 
             case Op::BATCH_TILE_SET:
-              do_batch_set(conn, req);
+              do_batch_set(*conn, req);
               comp.ok = true;
               break;
 
             case Op::BATCH_TILE_EXISTS:
-              do_batch_exists(conn, req);
+              do_batch_exists(*conn, req);
               comp.ok = true;
               break;
 
             case Op::BATCH_TILE_DELETE:
-              do_batch_delete(conn, req);
+              do_batch_delete(*conn, req);
               comp.ok = true;
               break;
           }
@@ -588,17 +798,13 @@ class ConnectorBase : public IStorageConnector {
           comp.error = e.what();
           // if shutting down, errors are expected
           if (stop_.load(std::memory_order_acquire)) {
-            break;  // exit without pushing completion
+            return epoch;  // exit without pushing completion
           }
         }
-
-        // 3. update shared batch state and push completion when done
-        handle_tile_completion(req, comp);
       }
-    } catch (const std::exception& e) {
-      fprintf(stderr, "[LMCache Connector Worker Error] %s\n", e.what());
-    } catch (...) {
-      fprintf(stderr, "[LMCache Connector Worker Error] Unknown exception\n");
+
+      // 3. update shared batch state and push completion when done
+      handle_tile_completion(req, comp);
     }
   }
 
@@ -643,6 +849,10 @@ class ConnectorBase : public IStorageConnector {
   std::atomic<bool> closed_{false};
   std::atomic<uint64_t> next_future_id_{1};
 
+  // worker threads started, and how many of them hold a connection right now
+  std::atomic<int> total_workers_{0};
+  std::atomic<int> connected_workers_{0};
+
  private:
   std::unique_ptr<EventNotifier> notifier_;
 
@@ -659,6 +869,18 @@ class ConnectorBase : public IStorageConnector {
   // completion queue (CQ)
   std::mutex comp_mu_;
   std::queue<Completion> completions_;
+
+  // reconnect(): bumping the epoch tells every worker to connect again. The
+  // workers report into the record below, which is only valid for the
+  // reconnect() whose epoch it holds.
+  std::atomic<uint64_t> reconnect_epoch_{0};
+  std::mutex reconnect_serial_mu_;
+  std::mutex reconnect_mu_;
+  std::condition_variable reconnect_cv_;
+  uint64_t reconnect_target_ = UINT64_MAX;  // guarded by reconnect_mu_
+  int reconnect_done_ = 0;                  // guarded by reconnect_mu_
+  int reconnect_failed_ = 0;                // guarded by reconnect_mu_
+  std::string reconnect_first_error_;       // guarded by reconnect_mu_
 
   std::vector<std::thread> workers_;
   // Populated only during start_workers() (single-threaded construction).

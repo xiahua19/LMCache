@@ -2,6 +2,7 @@
 
 #include "connector.h"
 #include <cerrno>
+#include <chrono>
 #include <stdexcept>
 #include <string_view>
 
@@ -12,40 +13,110 @@ namespace {
 
 constexpr size_t kMaxRespLineLength = 1024 * 1024;
 
+// How long a worker waits for the TCP handshake. close() does not wait for it:
+// the wait is cut into slices that check whether the connector is stopping.
+constexpr int kConnectTimeoutMs = 10000;
+constexpr int kConnectPollSliceMs = 100;
+
+constexpr std::string_view kPingCommand = "*1\r\n$4\r\nPING\r\n";
+constexpr std::string_view kPongReply = "+PONG\r\n";
+
 }  // namespace
 
-void WorkerConn::connect(const std::string& h, int p) {
-  host = h;
-  port = p;
-
-  // 1. create socket
+void WorkerConn::open_socket() {
   fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
     throw std::runtime_error("failed to create socket");
   }
+}
 
-  // 2. resolve host
-  struct addrinfo hints = {}, *result = nullptr;
-  hints.ai_family = AF_INET;
-  hints.ai_socktype = SOCK_STREAM;
+void WorkerConn::connect(const std::string& h, int p, int timeout_ms,
+                         const std::atomic<bool>* stop) {
+  host = h;
+  port = p;
 
-  std::string port_str = std::to_string(p);
-  int err = getaddrinfo(h.c_str(), port_str.c_str(), &hints, &result);
+  // 1. resolve host. An IPv4 literal needs no resolver, whose lookups cannot
+  // be interrupted.
+  struct sockaddr_storage addr = {};
+  socklen_t addr_len = 0;
+  struct sockaddr_in literal = {};
+  if (inet_pton(AF_INET, h.c_str(), &literal.sin_addr) == 1) {
+    literal.sin_family = AF_INET;
+    literal.sin_port = htons(static_cast<uint16_t>(p));
+    std::memcpy(&addr, &literal, sizeof(literal));
+    addr_len = sizeof(literal);
+  } else {
+    struct addrinfo hints = {}, *result = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
 
-  if (err != 0) {
-    ::close(fd);
-    throw std::runtime_error(std::string("getaddrinfo failed: ") +
-                             gai_strerror(err));
-  }
-
-  // 3. connect to host
-  if (::connect(fd, result->ai_addr, result->ai_addrlen) < 0) {
+    std::string port_str = std::to_string(p);
+    int err = getaddrinfo(h.c_str(), port_str.c_str(), &hints, &result);
+    if (err != 0) {
+      throw std::runtime_error(std::string("getaddrinfo failed: ") +
+                               gai_strerror(err));
+    }
+    std::memcpy(&addr, result->ai_addr, result->ai_addrlen);
+    addr_len = result->ai_addrlen;
     freeaddrinfo(result);
-    ::close(fd);
-    throw std::runtime_error("connection failed");
   }
 
-  freeaddrinfo(result);
+  // 2. connect without blocking, then wait in short slices so that a stop
+  // request or the timeout ends the wait promptly
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+    throw std::runtime_error("failed to set the socket non-blocking");
+  }
+
+  if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), addr_len) < 0) {
+    if (errno != EINPROGRESS) {
+      throw std::runtime_error(std::string("connection failed: ") +
+                               std::strerror(errno));
+    }
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+      if (stop != nullptr && stop->load(std::memory_order_acquire)) {
+        throw std::runtime_error("connection aborted: connector is closing");
+      }
+      auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           deadline - std::chrono::steady_clock::now())
+                           .count();
+      if (remaining <= 0) {
+        throw std::runtime_error("connection failed: timed out");
+      }
+      struct pollfd pfd = {fd, POLLOUT, 0};
+      int n = ::poll(&pfd, 1,
+                     static_cast<int>(
+                         std::min<long long>(remaining, kConnectPollSliceMs)));
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        throw std::runtime_error(std::string("connection failed: ") +
+                                 std::strerror(errno));
+      }
+      if (n > 0) break;
+    }
+    int so_error = 0;
+    socklen_t so_len = sizeof(so_error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_len) < 0) {
+      so_error = errno;
+    }
+    if (so_error != 0) {
+      throw std::runtime_error(std::string("connection failed: ") +
+                               std::strerror(so_error));
+    }
+  }
+
+  // 3. the data path expects a blocking socket
+  fcntl(fd, F_SETFL, flags);
+}
+
+void WorkerConn::set_io_timeout_ms(int timeout_ms) {
+  struct timeval tv = {};
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = (timeout_ms % 1000) * 1000;
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
 // call send multiple times until all the data is sent
@@ -57,6 +128,9 @@ void WorkerConn::send_all(const void* data, size_t len) {
     if (n < 0) {
       if (errno == EINTR) {
         continue;  // retry on EINTR
+      }
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        throw std::runtime_error("socket send timed out");
       }
       throw std::runtime_error("socket send failed");
     }
@@ -92,6 +166,9 @@ void WorkerConn::send_multipart(
       if (errno == EINTR) {
         continue;
       }
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        throw std::runtime_error("socket writev timed out");
+      }
       throw std::runtime_error("socket writev failed");
     }
     if (n == 0) {
@@ -124,6 +201,9 @@ void WorkerConn::recv_exactly(void* buf, size_t len) {
     if (n < 0) {
       if (errno == EINTR) {
         continue;
+      }
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        throw std::runtime_error("socket recv timed out");
       }
       throw std::runtime_error("socket recv failed");
     }
@@ -240,19 +320,43 @@ RedisConnector::~RedisConnector() { close(); }
 
 WorkerConn RedisConnector::create_connection() {
   WorkerConn conn;
-  conn.connect(host_, port_);
+  conn.open_socket();
+  // the handshake wait checks stop_, so close() never waits for it
+  conn.connect(host_, port_, kConnectTimeoutMs, &stop_);
 
   conn.username = username_;
   conn.password = password_;
-  conn.authenticate_if_needed();
 
-  // track socket fd for shutdown
-  {
-    std::lock_guard<std::mutex> lk(worker_fds_mu_);
-    worker_fds_.push_back(conn.fd);
+  // From here on a blocking send or recv can be interrupted by
+  // shutdown_connections(), AUTH included. If anything below throws, conn's
+  // destructor closes the fd, so it must not stay registered.
+  register_fd(conn.fd);
+  try {
+    conn.authenticate_if_needed();
+  } catch (...) {
+    unregister_fd(conn.fd);
+    throw;
   }
 
   return conn;
+}
+
+void RedisConnector::register_fd(int fd) {
+  std::lock_guard<std::mutex> lk(worker_fds_mu_);
+  if (shutting_down_) {
+    throw std::runtime_error("connector is closing");
+  }
+  worker_fds_.push_back(fd);
+}
+
+void RedisConnector::unregister_fd(int fd) {
+  std::lock_guard<std::mutex> lk(worker_fds_mu_);
+  for (auto it = worker_fds_.begin(); it != worker_fds_.end(); ++it) {
+    if (*it == fd) {
+      worker_fds_.erase(it);
+      return;
+    }
+  }
 }
 
 void RedisConnector::do_single_get(WorkerConn& conn, const std::string& key,
@@ -375,12 +479,84 @@ bool RedisConnector::do_single_delete(WorkerConn& conn,
 }
 
 void RedisConnector::shutdown_connections() {
+  {
+    std::lock_guard<std::mutex> lk(worker_fds_mu_);
+    shutting_down_ = true;
+  }
+  interrupt_connections();
+}
+
+void RedisConnector::interrupt_connections() {
   std::lock_guard<std::mutex> lk(worker_fds_mu_);
   for (int fd : worker_fds_) {
-    if (fd >= 0) {
-      ::shutdown(fd, SHUT_RDWR);
+    ::shutdown(fd, SHUT_RDWR);
+  }
+}
+
+// Must run before the connection's destructor closes the fd: once the fd is
+// closed its number can be reused, and interrupt_connections() would shut down
+// someone else's socket.
+void RedisConnector::connection_closed(WorkerConn& conn) {
+  unregister_fd(conn.fd);
+}
+
+// A fresh connection, AUTH and PING, all within timeout_ms: says whether the
+// server is there and answering, whatever state the workers are in. The
+// socket is private to this call, so nothing needs to interrupt it; the I/O
+// timeout bounds it instead. Only name resolution, if the host is not an IP
+// literal, is not bounded by timeout_ms.
+std::string RedisConnector::do_check_backend(int timeout_ms) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  auto remaining_ms = [&]() -> int {
+    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now())
+                    .count();
+    return static_cast<int>(std::max<long long>(left, 1));
+  };
+
+  try {
+    WorkerConn conn;
+    conn.open_socket();
+    conn.connect(host_, port_, timeout_ms, &stop_);
+    conn.username = username_;
+    conn.password = password_;
+
+    conn.set_io_timeout_ms(remaining_ms());
+    conn.authenticate_if_needed();
+
+    conn.set_io_timeout_ms(remaining_ms());
+    conn.send_all(kPingCommand.data(), kPingCommand.size());
+    char reply[7];
+    static_assert(sizeof(reply) == kPongReply.size(), "reply buffer size");
+    conn.recv_exactly(reply, sizeof(reply));
+    if (std::memcmp(reply, kPongReply.data(), kPongReply.size()) != 0) {
+      return "PING: reply was not +PONG";
+    }
+  } catch (const std::exception& e) {
+    return e.what();
+  }
+  return "";
+}
+
+// A server that restarted or was killed closed its end of every connection: a
+// peek at the socket shows the end of stream (or a reset) without consuming
+// anything, so it is safe next to a worker that is using the socket. A
+// connection cut without any packet (a network partition) cannot be seen this
+// way; the first request on it fails, and the data path reports that.
+std::string RedisConnector::do_find_broken_connection() {
+  std::lock_guard<std::mutex> lk(worker_fds_mu_);
+  for (int fd : worker_fds_) {
+    char byte;
+    ssize_t n = ::recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n == 0) {
+      return "a connection was closed by the server";
+    }
+    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+      return std::string("a connection is broken: ") + std::strerror(errno);
     }
   }
+  return "";
 }
 
 }  // namespace connector
